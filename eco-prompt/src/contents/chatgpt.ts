@@ -10,57 +10,6 @@ import {
 
 import FILLERS_RAW from "bundle-text:../data/fillers.txt"
 
-// ---------- Supabase REST config ----------
-const SUPABASE_URL = "https://xzuzepthtnckpspdlaap.supabase.co"
-const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh6dXplcHRodG5ja3BzcGRsYWFwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc4MDI3MjgsImV4cCI6MjA3MzM3ODcyOH0.TKTnYGi8SxzpgHsYShha4LHwvTxEVF6Y3Wbit4gIA1w"
-const TEMP_USER_ID = "ffd21808-54a7-4c3b-becb-6436341ed95f"
-const PROFILE_KEY: "user_id" | "id" = "user_id"
-
-const tryRpcIncrement = async (delta: number) => {
-  const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/increment_tokens_saved`, {
-    method: "POST",
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ p_user_id: TEMP_USER_ID, p_delta: Math.round(delta) })
-  })
-  return resp.ok
-}
-
-const fallbackIncrement = async (delta: number) => {
-  const q = encodeURIComponent(TEMP_USER_ID)
-  const r1 = await fetch(
-    `${SUPABASE_URL}/rest/v1/profiles?${PROFILE_KEY}=eq.${q}&select=total_tokens_saved`,
-    { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` } }
-  )
-  if (!r1.ok) return
-  const rows = await r1.json()
-  const current = Number(rows?.[0]?.total_tokens_saved ?? 0)
-  const next = current + Math.round(delta)
-
-  await fetch(`${SUPABASE_URL}/rest/v1/profiles?${PROFILE_KEY}=eq.${q}`, {
-    method: "PATCH",
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=minimal"
-    },
-    body: JSON.stringify({ total_tokens_saved: next })
-  })
-}
-
-const addSavedTokensToProfile = async (delta: number) => {
-  if (delta <= 0) return
-  try {
-    const ok = await tryRpcIncrement(delta)
-    if (!ok) await fallbackIncrement(delta)
-  } catch {}
-}
-
 // ---------- Content script config ----------
 export const config: PlasmoCSConfig = {
   matches: ["*://chat.openai.com/*", "*://chatgpt.com/*"],
@@ -96,6 +45,7 @@ const ensureStyle = () => {
       padding:6px 10px;font-size:12px;cursor:pointer
     }
     #eco-topright .btn:hover{background:#eef1f7}
+    #eco-topright .btn[disabled]{opacity:.55;cursor:not-allowed}
     @media (prefers-color-scheme: dark){
       #eco-topright .btn{background:#1c212b;border-color:#2a2f39;color:#e5e7eb}
       #eco-topright .btn:hover{background:#232938}
@@ -251,24 +201,26 @@ function setEditorText(text: string) {
   }))
 }
 
+// ---------- Hoisted, safe text extractor (prevents "not defined" errors) ----------
+function extractTextFromNode(el: Element | null): string {
+  if (!el) return ""
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+    return el.value || ""
+  }
+  if (el instanceof HTMLElement) {
+    return (el.innerText ?? el.textContent ?? "") as string
+  }
+  return ""
+}
+
 // ---------- capture user typing ----------
 let currentPrompt = ""
 
-const targetFromEventPath = (ev: Event): HTMLElement | null => {
-  const path = (ev.composedPath && ev.composedPath()) || []
-  for (const t of path) {
-    if (t && t instanceof HTMLElement) {
-      if (isEditorEl(t)) return t
-    }
-  }
-  return null
-}
-
-const extractTextFromNode = (el: Element | null): string => {
-  if (!isEditorEl(el)) return ""
-  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value || ""
-  return (el.innerText ?? el.textContent ?? "") as string
-}
+// ---------- preloaded trim state ----------
+let preTrimText: string | null = null
+let preTrimHasChange = false
+let preTrimTokensBefore = 0
+let preTrimTokensAfter  = 0
 
 // ---------- utils ----------
 const debounce = <F extends (...a: any[]) => void>(fn: F, ms = 120) => {
@@ -368,8 +320,16 @@ const render = () => {
     resolveLuckyInBg(raw)
   }
 
+  // impact for current raw text
   const tokens = safeTokenize(raw)
   const impact = tokensToImpact(tokens)
+
+  // PRELOAD: compute trimmed version + deltas now
+  const trimmed = stripFillers(raw)
+  preTrimText = trimmed
+  preTrimHasChange = trimmed !== raw
+  preTrimTokensBefore = safeTokenize(raw)
+  preTrimTokensAfter  = safeTokenize(trimmed)
 
   safeStore({ currentTokens: tokens, currentSource: "chatgpt" })
 
@@ -390,6 +350,12 @@ const render = () => {
       </div>
     </div>` : ""
 
+  const previewNote = preTrimHasChange
+    ? `<div class="small" style="margin-top:6px;opacity:.85">
+         Trim preview ready — will remove ${fmtInt(Math.max(0, preTrimTokensBefore - preTrimTokensAfter))} tokens.
+       </div>`
+    : `<div class="small" style="margin-top:6px;opacity:.65">Nothing to trim.</div>`
+
   panel.innerHTML = `
     <h3>EcoPrompt <span aria-hidden="true">&#x1F331;</span></h3>
     <div class="row">Tokens (incl. output est.): ${fmtInt(impact.tokens)}</div>
@@ -401,25 +367,27 @@ const render = () => {
       ≈ ${fmtEq(impact.eq.googleSearches)} searches
     </div>
     <div class="actions">
-      <button id="eco-trim" class="btn" title="Remove filler words from your prompt">Trim filler</button>
+      <button id="eco-trim" class="btn" ${preTrimHasChange ? "" : "disabled"} title="Replace your prompt with the pre-trimmed version">
+        Trim filler
+      </button>
     </div>
+    ${previewNote}
     ${toastHTML}
     ${googleSection}
   `
 
-  // Trim button
+  // Trim button uses the PRELOADED version instantly
   const btn = panel.querySelector<HTMLButtonElement>("#eco-trim")
   if (btn) {
     btn.onclick = () => {
-      const beforeText = getEditorText()
-      const afterText  = stripFillers(beforeText)
-      if (afterText !== beforeText) {
-        pendingTrimBeforeTokens = safeTokenize(beforeText) // snapshot before
-        setEditorText(afterText)
-        currentPrompt = afterText
-      } else {
+      if (!preTrimHasChange || !preTrimText) {
         pendingTrimBeforeTokens = null
+        return
       }
+      pendingTrimBeforeTokens = preTrimTokensBefore // snapshot preloaded "before"
+      setEditorText(preTrimText)
+      currentPrompt = preTrimText
+      debouncedRender()
     }
   }
 
@@ -438,10 +406,9 @@ const render = () => {
           "Opened top web result"
         )
         recordCumulative(fullTokensSaved, imp.gCO2)
-        addSavedTokensToProfile(fullTokensSaved)
       }
 
-      // We *do* want to allow later Trim savings to stack, but not double-count this one.
+      // Allow later Trim savings to stack, but not double-count this one.
       pendingTrimBeforeTokens = null
     }, { once: true, capture: true })
   }
@@ -476,9 +443,7 @@ const onSend = () => {
   const phoneChargesSaved = Math.max(0, b.eq.phoneCharges - a.eq.phoneCharges)
 
   addToSessionAndToast(tokensSaved, kwhSaved, gSaved, searchesSaved, phoneChargesSaved, "Trimmed prompt")
-
   recordCumulative(tokensSaved, gSaved)
-  addSavedTokensToProfile(tokensSaved)
 
   pendingTrimBeforeTokens = null
   debouncedRender()
@@ -499,10 +464,10 @@ document.addEventListener("keydown", (ev) => {
 const main = () => {
   render()
 
-  const updateFromEvent = (ev: Event) => {
-    const el = targetFromEventPath(ev) || (document.activeElement as Element | null)
-    if (isEditorEl(el)) lastEditor = el as EditorEl
-    currentPrompt = extractTextFromNode(el)
+  const updateFromEvent = () => {
+    const active = (document.activeElement as Element | null)
+    if (isEditorEl(active)) lastEditor = active as EditorEl
+    currentPrompt = extractTextFromNode(active)
     debouncedRender()
   }
   document.addEventListener("input", updateFromEvent, true)
